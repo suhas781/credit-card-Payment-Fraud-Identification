@@ -5,7 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+import math
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 RiskLevel = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
@@ -46,6 +48,14 @@ class TransactionInput(BaseModel):
     Amount: float
     Time: float
 
+    @model_validator(mode="after")
+    def finite_numbers(self) -> TransactionInput:
+        for name, v in self.model_dump().items():
+            x = float(v)
+            if not math.isfinite(x):
+                raise ValueError(f"{name} must be a finite number")
+        return self
+
 
 class ShapValueItem(BaseModel):
     feature: str
@@ -55,10 +65,14 @@ class ShapValueItem(BaseModel):
 
 class PredictResponse(BaseModel):
     is_fraud: bool
-    confidence: float
+    predicted_class: int = Field(ge=0, le=1, description="0=legit, 1=fraud at threshold")
+    fraud_probability: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(description="Alias: fraud class probability (same as fraud_probability)")
     threshold_used: float
     risk_level: RiskLevel
     shap_values: list[ShapValueItem]
+    reason_codes: list[str] = Field(default_factory=list)
+    reason_summary: str = ""
     transaction_id: str
     timestamp: str
 
@@ -167,3 +181,37 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     db_connected: bool
     uptime_seconds: float
+
+
+class ExplainFeatureItem(BaseModel):
+    feature: str
+    shap_value: float
+    direction: Literal["fraud", "legit"]
+
+
+class ExplainResponse(BaseModel):
+    expected_value_fraud_class: float
+    top_features: list[ExplainFeatureItem]
+    reason_codes: list[str]
+    reason_summary: str
+
+
+class StatsTotalResponse(BaseModel):
+    total_transactions: int
+
+
+class StatsFraudRateResponse(BaseModel):
+    total_transactions: int
+    fraud_count: int
+    legit_count: int
+    fraud_rate: float
+
+
+class StatsRecentResponse(BaseModel):
+    recent_transactions: list[RecentTransactionItem]
+    limit: int
+
+
+class StatsByHourResponse(BaseModel):
+    fraud_over_time: list[FraudOverTimePoint]
+    fraud_by_hour_of_day: list[HourOfDayPoint]

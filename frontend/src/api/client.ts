@@ -1,6 +1,7 @@
 import axios from 'axios'
 import type {
   BatchResult,
+  ExplainResult,
   HealthResponse,
   HistoryResponse,
   ModelInfo,
@@ -30,9 +31,24 @@ export function wsBaseUrl(): string {
   return base.includes('/ws/simulate') ? base : `${base}/ws/simulate`
 }
 
+function newRequestId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`
+}
+
 export const api = axios.create({
   baseURL: apiBaseUrl(),
   headers: { 'Content-Type': 'application/json' },
+})
+
+api.interceptors.request.use((config) => {
+  config.headers = config.headers ?? {}
+  if (!config.headers['X-Request-Id']) {
+    config.headers['X-Request-Id'] = newRequestId()
+  }
+  return config
 })
 
 export async function predictTransaction(
@@ -56,6 +72,13 @@ export async function batchPredict(file: File): Promise<BatchResult> {
 
 export async function getStats(): Promise<StatsResponse> {
   const { data } = await api.get<StatsResponse>('/stats')
+  return data
+}
+
+export async function explainTransaction(
+  body: TransactionInput,
+): Promise<ExplainResult> {
+  const { data } = await api.post<ExplainResult>('/explain', body)
   return data
 }
 

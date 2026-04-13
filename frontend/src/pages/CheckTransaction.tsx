@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { predictTransaction } from '../api/client'
+import { explainTransaction, predictTransaction } from '../api/client'
 import { ShapChart } from '../components/charts/ShapChart'
 import { PageWrapper } from '../components/layout/PageWrapper'
 import { FraudBadge } from '../components/ui/FraudBadge'
@@ -8,7 +8,7 @@ import { ConfidenceBar } from '../components/ui/ConfidenceBar'
 import { RiskMeter } from '../components/ui/RiskMeter'
 import { Spinner } from '../components/ui/Spinner'
 import { useTransactionForm } from '../hooks/useTransactionForm'
-import type { PredictionResult, RiskLevel } from '../types'
+import type { ExplainResult, PredictionResult, RiskLevel } from '../types'
 
 function RiskChip({ level }: { level: RiskLevel }) {
   const c =
@@ -40,6 +40,8 @@ export function CheckTransaction() {
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [explainOpen, setExplainOpen] = useState(false)
+  const [deepExplain, setDeepExplain] = useState<ExplainResult | null>(null)
+  const [explainLoading, setExplainLoading] = useState(false)
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -48,6 +50,7 @@ export function CheckTransaction() {
     try {
       const res = await predictTransaction(toInput())
       setResult(res)
+      setDeepExplain(null)
     } catch (err) {
       setResult(null)
       setError(err instanceof Error ? err.message : 'Request failed')
@@ -166,6 +169,25 @@ export function CheckTransaction() {
               <FraudBadge isFraud={result.is_fraud} />
               <RiskChip level={result.risk_level} />
             </div>
+            <div className="grid gap-3 text-sm text-[#d1d5db] sm:grid-cols-2">
+              <p>
+                <span className="text-[#9ca3af]">Predicted class</span>{' '}
+                <span className="font-mono font-semibold text-[#f9fafb]">
+                  {result.predicted_class ?? (result.is_fraud ? 1 : 0)} (0=legit, 1=fraud)
+                </span>
+              </p>
+              <p>
+                <span className="text-[#9ca3af]">Fraud probability</span>{' '}
+                <span className="font-mono font-semibold text-[#f9fafb]">
+                  {((result.fraud_probability ?? result.confidence) * 100).toFixed(2)}%
+                </span>
+              </p>
+            </div>
+            {result.reason_summary ? (
+              <p className="rounded-lg border border-indigo-500/20 bg-indigo-950/20 p-3 text-sm text-indigo-200">
+                {result.reason_summary}
+              </p>
+            ) : null}
             <div className="flex flex-col items-center gap-4 sm:flex-row sm:justify-around">
               <RiskMeter confidence={result.confidence} />
               <div className="w-full max-w-md flex-1">
@@ -179,20 +201,58 @@ export function CheckTransaction() {
               </h2>
               <ShapChart items={result.shap_values} />
             </div>
-            <button
-              type="button"
-              className="text-sm text-indigo-400"
-              onClick={() => setExplainOpen((o) => !o)}
-            >
-              {explainOpen ? 'Hide' : 'What does this mean?'}
-            </button>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                className="text-sm text-indigo-400"
+                onClick={() => setExplainOpen((o) => !o)}
+              >
+                {explainOpen ? 'Hide' : 'What does this mean?'}
+              </button>
+              <button
+                type="button"
+                disabled={explainLoading}
+                className="text-sm text-indigo-400 disabled:opacity-50"
+                onClick={async () => {
+                  setExplainLoading(true)
+                  try {
+                    const ex = await explainTransaction(toInput())
+                    setDeepExplain(ex)
+                    setExplainOpen(true)
+                  } catch {
+                    setDeepExplain(null)
+                  } finally {
+                    setExplainLoading(false)
+                  }
+                }}
+              >
+                {explainLoading ? 'Loading…' : 'Deep explain (top 15 SHAP)'}
+              </button>
+            </div>
             {explainOpen ? (
-              <p className="text-sm leading-relaxed text-[#9ca3af]">
-                Each bar shows how much a feature pushed the model toward fraud
-                (red) or away (green). Higher absolute values matter more for
-                this prediction. This is a local explanation — not global
-                risk for your business.
-              </p>
+              <div className="space-y-3 text-sm leading-relaxed text-[#9ca3af]">
+                <p>
+                  Each bar shows how much a feature pushed the model toward fraud
+                  (positive SHAP) or away (negative). Higher absolute values
+                  matter more for this prediction — local explanation only.
+                </p>
+                {deepExplain ? (
+                  <div className="rounded-lg border border-[rgba(255,255,255,0.08)] bg-[#0a0f1e] p-3 font-mono text-xs text-[#d1d5db]">
+                    <p className="mb-2 text-[#9ca3af]">
+                      E[fraud] baseline ≈{' '}
+                      {deepExplain.expected_value_fraud_class.toFixed(4)}
+                    </p>
+                    <ul className="max-h-40 space-y-1 overflow-y-auto">
+                      {deepExplain.top_features.map((f) => (
+                        <li key={f.feature}>
+                          {f.feature}: {f.shap_value.toFixed(4)} ({f.direction})
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-2 text-indigo-200">{deepExplain.reason_summary}</p>
+                  </div>
+                ) : null}
+              </div>
             ) : null}
             <p className="font-mono text-xs text-[#6b7280]">
               {result.transaction_id} · {result.timestamp}

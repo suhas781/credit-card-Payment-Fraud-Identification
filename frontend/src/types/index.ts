@@ -41,10 +41,14 @@ export interface ShapValue {
 
 export interface PredictionResult {
   is_fraud: boolean
+  predicted_class: 0 | 1
+  fraud_probability: number
   confidence: number
   threshold_used: number
   risk_level: RiskLevel
   shap_values: ShapValue[]
+  reason_codes: string[]
+  reason_summary: string
   transaction_id: string
   timestamp: string
 }
@@ -145,4 +149,17 @@ export interface HealthResponse {
   model_loaded: boolean
   db_connected: boolean
   uptime_seconds: number
+}
+
+export interface ExplainFeature {
+  feature: string
+  shap_value: number
+  direction: 'fraud' | 'legit'
+}
+
+export interface ExplainResult {
+  expected_value_fraud_class: number
+  top_features: ExplainFeature[]
+  reason_codes: string[]
+  reason_summary: string
 }

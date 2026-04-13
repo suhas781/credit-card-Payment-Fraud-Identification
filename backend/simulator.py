@@ -42,7 +42,25 @@ def _ensure_loaded() -> pd.DataFrame:
 
 
 def sample_row_dict() -> dict[str, float]:
+    """
+    Sample one row. SIMULATE_MODE:
+    - balanced (default): random row
+    - fraud_heavy: prefer Class==1 when column exists
+    - legit_heavy: prefer Class==0
+    """
     df = _ensure_loaded()
+    mode = os.environ.get("SIMULATE_MODE", "balanced").lower()
+    if "Class" in df.columns:
+        if mode == "fraud_heavy":
+            sub = df[df["Class"] == 1]
+            if len(sub) >= 1:
+                row = sub.sample(n=1, random_state=None).iloc[0]
+                return {k: float(row[k]) for k in _RAW}
+        if mode == "legit_heavy":
+            sub = df[df["Class"] == 0]
+            if len(sub) >= 1:
+                row = sub.sample(n=1, random_state=None).iloc[0]
+                return {k: float(row[k]) for k in _RAW}
     row = df.sample(n=1, random_state=None).iloc[0]
     return {k: float(row[k]) for k in _RAW}
 
@@ -59,6 +77,7 @@ def build_simulation_message() -> dict:
         transaction_id,
         _features,
         risk_level,
+        *_rest,
     ) = pred.predict_one(raw)
     from datetime import datetime, timezone
 

@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
+from db import insert_user_action
 from schemas import SimulateToggleBody
 from simulator import build_simulation_message
 
@@ -71,7 +72,23 @@ async def websocket_simulate(websocket: WebSocket) -> None:
         manager.disconnect(websocket)
 
 
+@router.get("/simulate/status")
+async def simulate_status(request: Request) -> dict[str, bool]:
+    return {"active": bool(getattr(request.app.state, "simulation_active", False))}
+
+
 @router.post("/simulate/toggle")
 async def simulate_toggle(request: Request, body: SimulateToggleBody) -> dict[str, bool]:
     request.app.state.simulation_active = body.active
+    try:
+        await insert_user_action(
+            request.app.state.db,
+            action="simulate_toggle",
+            detail={"active": body.active},
+            request_id=request.headers.get("X-Request-Id")
+            or request.headers.get("X-Request-ID"),
+            client_ip=request.client.host if request.client else None,
+        )
+    except Exception:
+        pass
     return {"active": bool(request.app.state.simulation_active)}

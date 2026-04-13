@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -10,7 +11,15 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 
 from risk import confidence_to_risk_level
 
+logger = logging.getLogger(__name__)
+
 _client: AsyncIOMotorClient | None = None
+
+# Logical collection names (operational + audit)
+COL_TRANSACTIONS = "transactions"
+COL_PREDICTIONS = "predictions"
+COL_MODEL_LOGS = "model_logs"
+COL_USER_ACTIONS = "user_actions"
 
 
 def init_mongo(uri: str) -> None:
@@ -30,12 +39,96 @@ def get_database(db_name: str) -> AsyncIOMotorDatabase:
     return get_client()[db_name]
 
 
+async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
+    """Create indexes for analytics and audit queries (idempotent)."""
+    try:
+        await db[COL_TRANSACTIONS].create_index([("timestamp", -1)])
+        await db[COL_TRANSACTIONS].create_index("transaction_id", unique=True)
+        await db[COL_PREDICTIONS].create_index([("timestamp", -1)])
+        await db[COL_PREDICTIONS].create_index("transaction_id", unique=True)
+        await db[COL_PREDICTIONS].create_index("request_id")
+        await db[COL_MODEL_LOGS].create_index([("timestamp", -1)])
+        await db[COL_USER_ACTIONS].create_index([("timestamp", -1)])
+        await db[COL_USER_ACTIONS].create_index("action")
+    except Exception as e:
+        logger.warning("ensure_indexes: %s", e)
+
+
 async def ping_db(db: AsyncIOMotorDatabase) -> bool:
     try:
         await db.command("ping")
         return True
     except Exception:
         return False
+
+
+async def insert_prediction_record(
+    db: AsyncIOMotorDatabase,
+    *,
+    transaction_id: str,
+    input_payload: dict[str, Any],
+    scaled_features: dict[str, float],
+    prediction: int,
+    fraud_probability: float,
+    threshold_used: float,
+    is_fraud: bool,
+    risk_level: str,
+    shap_top5: list[dict[str, Any]],
+    request_id: str | None,
+    user_id: str | None,
+    session_id: str | None,
+) -> None:
+    """ML audit trail: raw input + outputs + client metadata."""
+    doc = {
+        "transaction_id": transaction_id,
+        "input_payload": input_payload,
+        "scaled_features": scaled_features,
+        "prediction": prediction,
+        "fraud_probability": fraud_probability,
+        "threshold_used": threshold_used,
+        "is_fraud": is_fraud,
+        "risk_level": risk_level,
+        "shap_top5": shap_top5,
+        "timestamp": datetime.now(timezone.utc),
+        "request_id": request_id,
+        "user_id": user_id,
+        "session_id": session_id,
+    }
+    await db[COL_PREDICTIONS].insert_one(doc)
+
+
+async def insert_model_log(
+    db: AsyncIOMotorDatabase,
+    *,
+    event: str,
+    detail: dict[str, Any],
+) -> None:
+    await db[COL_MODEL_LOGS].insert_one(
+        {
+            "event": event,
+            "detail": detail,
+            "timestamp": datetime.now(timezone.utc),
+        }
+    )
+
+
+async def insert_user_action(
+    db: AsyncIOMotorDatabase,
+    *,
+    action: str,
+    detail: dict[str, Any],
+    request_id: str | None = None,
+    client_ip: str | None = None,
+) -> None:
+    await db[COL_USER_ACTIONS].insert_one(
+        {
+            "action": action,
+            "detail": detail,
+            "request_id": request_id,
+            "client_ip": client_ip,
+            "timestamp": datetime.now(timezone.utc),
+        }
+    )
 
 
 async def insert_transaction(
@@ -50,7 +143,13 @@ async def insert_transaction(
     is_fraud: bool,
     risk_level: str,
     shap_top5: list[dict[str, Any]],
+    input_payload: dict[str, Any] | None = None,
+    request_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+    threshold_used: float | None = None,
 ) -> None:
+    ts = datetime.now(timezone.utc)
     doc = {
         "transaction_id": transaction_id,
         "features": features,
@@ -61,9 +160,49 @@ async def insert_transaction(
         "is_fraud": is_fraud,
         "risk_level": risk_level,
         "shap_top5": shap_top5,
-        "timestamp": datetime.now(timezone.utc),
+        "timestamp": ts,
+        "input_payload": input_payload,
+        "request_id": request_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "threshold_used": threshold_used,
     }
-    await db["transactions"].insert_one(doc)
+    await db[COL_TRANSACTIONS].insert_one(doc)
+
+    await insert_prediction_record(
+        db,
+        transaction_id=transaction_id,
+        input_payload=input_payload or {},
+        scaled_features=features,
+        prediction=prediction,
+        fraud_probability=confidence,
+        threshold_used=float(threshold_used or 0.5),
+        is_fraud=is_fraud,
+        risk_level=risk_level,
+        shap_top5=shap_top5,
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
+
+
+def _transaction_doc_to_prediction(doc: dict[str, Any]) -> dict[str, Any]:
+    """Mirror a transactions row into predictions collection shape."""
+    return {
+        "transaction_id": doc["transaction_id"],
+        "input_payload": doc.get("input_payload") or {},
+        "scaled_features": doc.get("features") or {},
+        "prediction": doc.get("prediction", 0),
+        "fraud_probability": float(doc.get("confidence", 0.0)),
+        "threshold_used": float(doc.get("threshold_used", 0.5)),
+        "is_fraud": bool(doc.get("is_fraud", False)),
+        "risk_level": str(doc.get("risk_level", "LOW")),
+        "shap_top5": doc.get("shap_top5") or [],
+        "timestamp": doc["timestamp"],
+        "request_id": doc.get("request_id"),
+        "user_id": doc.get("user_id"),
+        "session_id": doc.get("session_id"),
+    }
 
 
 async def insert_transactions_bulk(
@@ -73,10 +212,13 @@ async def insert_transactions_bulk(
 ) -> None:
     if not docs:
         return
-    coll = db["transactions"]
+    coll = db[COL_TRANSACTIONS]
+    pred_coll = db[COL_PREDICTIONS]
     for i in range(0, len(docs), chunk_size):
         chunk = docs[i : i + chunk_size]
         await coll.insert_many(chunk, ordered=False)
+        pred_docs = [_transaction_doc_to_prediction(d) for d in chunk]
+        await pred_coll.insert_many(pred_docs, ordered=False)
 
 
 def _ts_iso(ts: Any) -> str:
@@ -117,7 +259,7 @@ def empty_stats_payload() -> dict[str, Any]:
 
 
 async def fetch_stats(db: AsyncIOMotorDatabase) -> dict[str, Any]:
-    coll = db["transactions"]
+    coll = db[COL_TRANSACTIONS]
     total = await coll.count_documents({})
     fraud_count = await coll.count_documents({"is_fraud": True})
     legit_count = max(0, total - fraud_count)
@@ -236,7 +378,7 @@ async def fetch_history(
     date_from: str | None,
     date_to: str | None,
 ) -> dict[str, Any]:
-    coll = db["transactions"]
+    coll = db[COL_TRANSACTIONS]
     q: dict[str, Any] = {}
     if is_fraud is not None:
         q["is_fraud"] = is_fraud
@@ -284,6 +426,80 @@ async def fetch_history(
         "total": total,
         "page": page,
         "pages": pages,
+    }
+
+
+async def fetch_stats_total(db: AsyncIOMotorDatabase) -> dict[str, Any]:
+    coll = db[COL_TRANSACTIONS]
+    total = await coll.count_documents({})
+    return {"total_transactions": total}
+
+
+async def fetch_stats_fraud_rate(db: AsyncIOMotorDatabase) -> dict[str, Any]:
+    coll = db[COL_TRANSACTIONS]
+    total = await coll.count_documents({})
+    fraud_count = await coll.count_documents({"is_fraud": True})
+    legit_count = max(0, total - fraud_count)
+    fraud_rate = (fraud_count / total) if total else 0.0
+    return {
+        "total_transactions": total,
+        "fraud_count": fraud_count,
+        "legit_count": legit_count,
+        "fraud_rate": fraud_rate,
+    }
+
+
+async def fetch_stats_recent_only(
+    db: AsyncIOMotorDatabase, *, limit: int = 20
+) -> dict[str, Any]:
+    coll = db[COL_TRANSACTIONS]
+    limit = max(1, min(limit, 200))
+    cursor = coll.find().sort("timestamp", -1).limit(limit)
+    recent_docs = await cursor.to_list(limit)
+    recent_transactions = [
+        {
+            "transaction_id": str(doc.get("transaction_id", "")),
+            "is_fraud": bool(doc.get("is_fraud", False)),
+            "confidence": float(doc.get("confidence", 0.0)),
+            "Amount": float(doc.get("raw_amount", 0.0)),
+            "timestamp": _ts_iso(doc["timestamp"]),
+            "risk_level": _doc_risk(doc),
+        }
+        for doc in recent_docs
+    ]
+    return {"recent_transactions": recent_transactions, "limit": limit}
+
+
+async def fetch_stats_by_hour(db: AsyncIOMotorDatabase) -> dict[str, Any]:
+    coll = db[COL_TRANSACTIONS]
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=24)
+    since = since.replace(minute=0, second=0, microsecond=0)
+    match = {"is_fraud": True, "timestamp": {"$gte": since}}
+    fraud_docs = await coll.find(match).to_list(100_000)
+    by_hour: defaultdict[str, int] = defaultdict(int)
+    for doc in fraud_docs:
+        ts = doc["timestamp"]
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        key = ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:00")
+        by_hour[key] += 1
+    fraud_over_time: list[dict[str, Any]] = []
+    for i in range(24):
+        bucket = since + timedelta(hours=i)
+        hour_label = bucket.strftime("%Y-%m-%d %H:00")
+        fraud_over_time.append({"hour": hour_label, "count": by_hour.get(hour_label, 0)})
+    hod: defaultdict[int, int] = defaultdict(int)
+    cursor_hod = coll.find({"is_fraud": True}, {"timestamp": 1})
+    for doc in await cursor_hod.to_list(500_000):
+        ts = doc["timestamp"]
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        hod[int(ts.astimezone(timezone.utc).hour)] += 1
+    fraud_by_hour_of_day = [{"hour": h, "count": hod.get(h, 0)} for h in range(24)]
+    return {
+        "fraud_over_time": fraud_over_time,
+        "fraud_by_hour_of_day": fraud_by_hour_of_day,
     }
 
 

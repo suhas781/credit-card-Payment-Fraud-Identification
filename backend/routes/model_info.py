@@ -9,7 +9,7 @@ from pathlib import Path
 import joblib
 from fastapi import APIRouter, HTTPException
 
-from predict import _model_dir, load_artifacts
+from predict import get_model_dir, load_artifacts
 from schemas import ModelInfoResponse
 
 router = APIRouter(tags=["model"])
@@ -17,7 +17,7 @@ router = APIRouter(tags=["model"])
 
 def _build_model_info() -> ModelInfoResponse:
     load_artifacts()
-    d = _model_dir()
+    d = get_model_dir()
     metrics_path = d / "training_metrics.json"
     if not metrics_path.is_file():
         raise FileNotFoundError("training_metrics.json missing")
