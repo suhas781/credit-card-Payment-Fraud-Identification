@@ -1,0 +1,9 @@
+{
+  "auc_roc": 0.9982,
+  "avg_precision": 0.8824,
+  "f1_score": 0.889,
+  "training_date": "2026-03-28",
+  "dataset_total_samples": 120000,
+  "dataset_fraud_samples": 207,
+  "dataset_fraud_rate": 0.001725
+}

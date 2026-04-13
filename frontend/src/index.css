@@ -1,0 +1,17 @@
+@import 'tailwindcss';
+@config '../tailwind.config.js';
+
+@layer base {
+  html {
+    font-family:
+      'Inter',
+      system-ui,
+      -apple-system,
+      sans-serif;
+  }
+  body {
+    @apply min-h-screen antialiased;
+    background-color: #0a0f1e;
+    color: #f9fafb;
+  }
+}
